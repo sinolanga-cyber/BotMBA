@@ -13,7 +13,7 @@ from openai import OpenAI
 # ----------------------------
 # Config you should edit
 # ----------------------------
-DATA_DIR = "./sinolanga-cyber/MBA_gbt/main"                  # put your files here
+DATA_DIR = "./sinolanga-cyber/BotMBA/main"                  # put your files here
 WEBSITE_URL = "https://www.dmre.gov.za/energy-resources/energy-statistics-reports/petroleum-products/supply-and-demand"  # put your website link here
 MODEL = "gpt-4.1-mini"               # you can switch models if you want
 
