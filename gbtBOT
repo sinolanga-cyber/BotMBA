@@ -1,0 +1,212 @@
+import os
+import sys
+import time
+import mimetypes
+import tempfile
+from pathlib import Path
+
+import requests
+from bs4 import BeautifulSoup
+
+from openai import OpenAI
+
+# ----------------------------
+# Config you should edit
+# ----------------------------
+DATA_DIR = "./sinolanga-cyber/MBA_gbt/main"                  # put your files here
+WEBSITE_URL = "https://www.dmre.gov.za/energy-resources/energy-statistics-reports/petroleum-products/supply-and-demand"  # put your website link here
+MODEL = "gpt-4.1-mini"               # you can switch models if you want
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def fetch_website_text(url: str, timeout: int = 20) -> str:
+    """Download a webpage and extract readable text."""
+    headers = {"User-Agent": "Mozilla/5.0 (rag-bot)"}
+    r = requests.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # remove scripts/styles
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    text = soup.get_text(separator="\n")
+    # light cleanup
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    cleaned = "\n".join(lines)
+    return cleaned
+
+
+def list_files(data_dir: str):
+    """Return file paths in data_dir (non-recursive) that look uploadable."""
+    p = Path(data_dir)
+    if not p.exists():
+        return []
+    files = []
+    for f in p.iterdir():
+        if f.is_file():
+            files.append(f)
+    return files
+
+
+def upload_file(client: OpenAI, path: Path) -> str:
+    """
+    Upload a file to OpenAI Files API for use with vector stores.
+    Returns file_id.
+    """
+    with path.open("rb") as fp:
+        uploaded = client.files.create(file=fp, purpose="assistants")
+    return uploaded.id
+
+
+def add_files_to_vector_store(client: OpenAI, vector_store_id: str, file_ids: list[str]):
+    """
+    Attach files to a vector store (they'll be parsed/chunked/indexed).
+    """
+    # Create file batches (recommended) so indexing happens async,
+    # but we’ll do a simple polling loop so the script is “one run”.
+    batch = client.vector_stores.file_batches.create(
+        vector_store_id=vector_store_id,
+        file_ids=file_ids,
+    )
+
+    # Poll until complete
+    while True:
+        batch = client.vector_stores.file_batches.retrieve(
+            vector_store_id=vector_store_id,
+            batch_id=batch.id,
+        )
+        status = batch.status
+        if status in ("completed", "failed", "cancelled"):
+            break
+        time.sleep(1)
+
+    if batch.status != "completed":
+        raise RuntimeError(f"Vector store indexing not completed. Status: {batch.status}")
+
+
+def build_vector_store_with_data_and_site(client: OpenAI, data_dir: str, website_url: str) -> str:
+    """
+    Create a vector store and add:
+      - all files in data_dir
+      - one generated TXT file containing website text
+    Returns vector_store_id.
+    """
+    # 1) Create vector store
+    vs = client.vector_stores.create(name="rag-bot-store")
+    vector_store_id = vs.id
+
+    # 2) Collect local files
+    local_files = list_files(data_dir)
+
+    file_ids = []
+
+    # Upload local files
+    for f in local_files:
+        try:
+            file_id = upload_file(client, f)
+            file_ids.append(file_id)
+            print(f"Uploaded local file: {f.name}")
+        except Exception as e:
+            print(f"Skipping {f} (upload error): {e}")
+
+    # 3) Fetch website and save to temp file for upload
+    try:
+        site_text = fetch_website_text(website_url)
+        if not site_text.strip():
+            raise ValueError("Website text was empty after extraction.")
+
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as tmp:
+            tmp.write(f"SOURCE_URL: {website_url}\n\n")
+            tmp.write(site_text)
+            tmp_path = Path(tmp.name)
+
+        site_file_id = upload_file(client, tmp_path)
+        file_ids.append(site_file_id)
+        print(f"Uploaded website text from: {website_url}")
+
+        # cleanup temp file
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"Website fetch/upload failed (continuing with local files only): {e}")
+
+    if not file_ids:
+        raise RuntimeError(
+            "No files were uploaded. Put files into ./data and/or set a working WEBSITE_URL."
+        )
+
+    # 4) Add everything to vector store and wait for indexing
+    add_files_to_vector_store(client, vector_store_id, file_ids)
+    print("Vector store ready!")
+
+    return vector_store_id
+
+
+def ask_bot(client: OpenAI, vector_store_id: str, user_question: str) -> str:
+    """
+    Ask the bot a question, letting it retrieve relevant chunks from your vector store.
+    Uses Responses API + file_search tool.
+    """
+    resp = client.responses.create(
+        model=MODEL,
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful study assistant. Use the provided files to answer. "
+                    "If you don’t find the answer in the files, say what’s missing."
+                ),
+            },
+            {"role": "user", "content": user_question},
+        ],
+        tools=[{"type": "file_search"}],
+        tool_resources={"file_search": {"vector_store_ids": [vector_store_id]}},
+    )
+
+    # Extract text output safely
+    # The SDK can return multiple output items; we’ll join text parts.
+    out_text = []
+    for item in resp.output:
+        if item.type == "message":
+            for c in item.content:
+                if c.type == "output_text":
+                    out_text.append(c.text)
+
+    return "\n".join(out_text).strip() or "(No text output received.)"
+
+
+def main():
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        print("Missing OPENAI_API_KEY environment variable.")
+        sys.exit(1)
+
+    client = OpenAI()
+
+    print("Building knowledge base (files + website)...")
+    vector_store_id = build_vector_store_with_data_and_site(client, DATA_DIR, WEBSITE_URL)
+
+    print("\nReady! Ask questions. Type 'exit' to quit.\n")
+    while True:
+        q = input("You: ").strip()
+        if not q:
+            continue
+        if q.lower() in ("exit", "quit"):
+            break
+
+        try:
+            answer = ask_bot(client, vector_store_id, q)
+            print("\nBot:", answer, "\n")
+        except Exception as e:
+            print(f"\nBot error: {e}\n")
+
+
+if __name__ == "__main__":
+    main()
